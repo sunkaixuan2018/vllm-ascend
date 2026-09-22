@@ -33,9 +33,9 @@
 - 已补 cold-start、全 inactive、部分有效尾行、非零 compressor/indexer，以及设备上
   main state/compressed KV 共用一份 allocation 的按字节校验。B4/S1、B4/S6、B40/S6
   的128K trace 均通过输出/cache/state检查，已下载到本地。
-- 测试使用 PyPTO 机器的 dsj-pypto-dev、PTOAS0.63；必须显式传入队列卡号：
-  `task-submit --device auto --ptoas 0.63 --max-time 0 --run "... csa_tp1_s6_gate.py --batch 4 --device {}"`。
-  不传卡号的旧并发提交结果不计入本次验收。详细任务号、产物和瓶颈数据见 Run062 §15.8–15.9。
+- 测试使用 PyPTO 机器的 dsj-pypto-dev、PTOAS0.63；测试脚本显式接收task-submit
+  分配的设备号。不传卡号的旧并发提交结果不计入本次验收。
+  详细任务号、产物和瓶颈数据见 Run062 §15.8–15.9。
 - 单步kernel golden使用合成输入；不代表真实请求激活回放、多轮持久cache或
   旧/新版本同负载性能A/B已完成；截图旧数字不能直接作为新版本收益基线。
 
@@ -66,27 +66,11 @@ native为 `AscendDSAImpl.forward()`；PTO为 `build_args()` 加注册的attentio
 native的 `multistream_dsa_preprocess` 和 `multistream_dsv4_dsa_overlap` 均关闭，
 不宣称这是native所有调优配置中的最优结果。此性能记录不构成精度验收。
 
-可复用的测试入口：
-
-- `tools/pto_csa/kernel/csa_tp1_s6_gate.py`：单卡kernel golden、inactive/tail、共享页测试；
-  需要将pypto-lib（含golden）及其dspark model helpers加入 `PYTHONPATH`，
-  也可用 `PYPTO_LIB_MODEL_DIR` 指定model helpers。
-- `tools/pto_csa/kernel/impl_forward_ab.py`：真实权重native/PTO单步对比；
-  `--performance` 切换为固定B4/S6/128K的ACLGraph微基准，`--perf-profile` 另采trace。
-  环境需要匹配的vLLM、vLLM Ascend原生算子、torch-npu与PyPTO kernel-mode支持。
-  本次环境使用Python3.11、Torch2.10.0 CPU、torch-npu2.10.0、vLLM0.20.2、
-  当前vLLM Ascend源码及新编译的native算子、CANN9.0.0、PTOAS0.63。
-
-在已加载正确环境、仓库根目录下，替换checkpoint路径后运行：
-
-```bash
-export PTO_CSA=0 PTO_ATTN_TP=1 PTO_DSPARK_SPEC_TOKENS=5 PYPTO_CACHE=1
-unset ASCEND_LAUNCH_BLOCKING PTO_ATTN_COMPARE PTO_CSA_PROBE
-task-submit --device auto --ptoas 0.63 --max-time 900 --run \
-  "python tools/pto_csa/kernel/impl_forward_ab.py --device {} --extension-dir ./vllm_ascend --model /path/to/checkpoint --out-dir build_output/impl-perf --batch 4 --seq 6 --start-pos 131066 --steps 1 --performance --perf-rounds 6 --perf-iterations 50 --perf-profile"
-```
-
-测试不会自动安装依赖或重置设备。多步状态、真实服务请求以及完整数值闭环仍待验证。
+上述单卡kernel gate与单层A/B使用本地实验脚本，按提交范围要求未纳入本PR；
+脚本、命令和产物保留在Run062任务记录中。仓内保留CPU接口契约测试。
+性能环境使用Python3.11、Torch2.10.0 CPU、torch-npu2.10.0、vLLM0.20.2、
+当前vLLM Ascend源码及新编译的native算子、CANN9.0.0、PTOAS0.63。
+多步状态、真实服务请求以及完整数值闭环仍待验证。
 
 这条分支把 DeepSeek-V4 某一层的 `attention.forward` 整段换成 PyPTO 写的 CSA 算子,
 在 vLLM 的真实推理服务路径上跑。本文给 pypto-lib 侧同事看,不假设读者了解 vLLM 这边。
