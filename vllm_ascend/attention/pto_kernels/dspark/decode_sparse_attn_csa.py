@@ -80,7 +80,6 @@ LOCAL_O_GROUPS = O_GROUPS // TP
 GROUP_T_PAD = TP * T_PAD
 ATTENTION_WINDOW_ROWS = LOCAL_O_GROUPS * GROUP_T_PAD
 PUBLISH_GROUPS = H_TILE // HEADS_PER_GROUP
-ROPE_CS_T_TILE = 8
 TOPK = WIN + CMP_TOPK
 SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)  # Sparse-K block floor
 # One whole 64-byte DDR line per token row of valid_block_mask: the plan lanes
@@ -118,17 +117,17 @@ def sparse_attn_csa(
     idx_topk: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
     position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     plan_dep: pl.Scalar[pl.TASK_ID],
     page_rows: pl.constexpr,
 ):
-    """Plan and run CSA QK/PV over sparse blocks, and build inverse-RoPE metadata."""
+    """Plan and run CSA QK/PV over sparse blocks."""
     # Compressed index contract.
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     t_dim = pl.tensor.dim(q, 0)
     t_heads = t_dim * H
-    rope_cs_blocks = t_dim // ROPE_CS_T_TILE
+    s_dim = t_dim // pl.tensor.dim(cmp_block_table, 0)
+    plan_rows = ((t_dim + BIAS_T_TILE - 1) // BIAS_T_TILE) * BIAS_T_TILE
+    positions_row = pl.reshape(position_ids, [1, t_dim])
     ori_kv_flat = pl.reshape(
         ori_kv, [ori_block_num * page_rows, HEAD_DIM],
     )
@@ -137,9 +136,9 @@ def sparse_attn_csa(
         ori_kv_flat[0:1, 0:HEAD_DIM] = ori_kv_flat[0:1, 0:HEAD_DIM]
 
     # Sparse slot indices, additive softmax bias, and per-block validity.
-    sparse_bias = pl.create_tensor([t_dim, PADDED_TOPK], dtype=pl.FP32)
-    cmp_sparse_indices = pl.create_tensor([t_dim, CMP_TOPK], dtype=pl.INT32)
-    valid_block_mask = pl.create_tensor([t_dim, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
+    sparse_bias = pl.create_tensor([plan_rows, PADDED_TOPK], dtype=pl.FP32)
+    cmp_sparse_indices = pl.create_tensor([plan_rows, CMP_TOPK], dtype=pl.INT32)
+    valid_block_mask = pl.create_tensor([plan_rows, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
     # Every token tile is independent: it reads its own idx_topk / position_ids /
     # window_swa_indices rows and writes its own cmp_sparse_indices, valid_block_mask
     # and sparse_bias rows, so the tiles spread over lanes instead of one core.
@@ -152,8 +151,15 @@ def sparse_attn_csa(
         plan_worker = pl.tile.get_block_idx()
         # Valid compressed slots.
         for bias_t0 in pl.range(plan_worker * BIAS_T_TILE, t_dim, CSA_PLAN_WORKERS * BIAS_T_TILE):
-            c_raw = pl.cast(idx_topk[bias_t0 : bias_t0 + BIAS_T_TILE, 0:IDX_TOPK], target_type=pl.FP32)
-            c_pos = pl.cast(position_ids[bias_t0 : bias_t0 + BIAS_T_TILE, 0:1], target_type=pl.FP32)
+            bias_rows = pl.min(BIAS_T_TILE, t_dim - bias_t0)
+            c_raw = pl.cast(pl.fillpad(pl.slice(
+                idx_topk, [BIAS_T_TILE, IDX_TOPK], [bias_t0, 0],
+                valid_shape=[bias_rows, IDX_TOPK],
+            ), pad_value=pl.PadValue.min), target_type=pl.FP32)
+            c_pos = pl.cast(pl.reshape(pl.fillpad(pl.slice(
+                positions_row, [1, BIAS_T_TILE], [0, bias_t0],
+                valid_shape=[1, bias_rows],
+            ), pad_value=pl.PadValue.zero), [BIAS_T_TILE, 1]), target_type=pl.FP32)
             c_pos_scaled = pl.mul(pl.add(c_pos, 1.0), COMPRESS_RATIO_INV)
             c_pos_i32 = pl.cast(c_pos_scaled, target_type=pl.INT32, mode="trunc")
             c_pos_q = pl.cast(c_pos_i32, target_type=pl.FP32)
@@ -164,7 +170,10 @@ def sparse_attn_csa(
             c_mask = pl.mul(c_ge, c_lt)
             c_out = pl.sub(pl.mul(c_mask, pl.add(c_raw, 1.0)), 1.0)
             cmp_sparse_indices[bias_t0 : bias_t0 + BIAS_T_TILE, 0:IDX_TOPK] = pl.cast(c_out, target_type=pl.INT32)
-            v_win_f = pl.cast(window_swa_indices[bias_t0 : bias_t0 + BIAS_T_TILE, 0:WIN], target_type=pl.FP32)
+            v_win_f = pl.cast(pl.fillpad(pl.slice(
+                window_swa_indices, [BIAS_T_TILE, WIN], [bias_t0, 0],
+                valid_shape=[bias_rows, WIN],
+            ), pad_value=pl.PadValue.min), target_type=pl.FP32)
             v_win_valid = pl.minimum(pl.maximum(pl.add(v_win_f, 1.0), 0.0), 1.0)
             # Scalar writes, but VALID_BLOCK_MASK_COLS gives every token row its own
             # whole 64-byte line, and a lane owns BIAS_T_TILE entire rows, so no two
@@ -214,7 +223,7 @@ def sparse_attn_csa(
         qk_core = pl.tile.get_block_idx()
         pl.system.set_ffts(ffts_workspace)
         for qk_t in pl.range(qk_core, t_dim, NUM_QK_CORES):
-            qk_b = qk_t // S
+            qk_b = qk_t // s_dim
             qk_q = pl.load(
                 q_flat, [qk_t * H, 0], [H, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
             )
@@ -393,46 +402,11 @@ def sparse_attn_csa(
                 pl.store(running_left, [qk_output_row, 0], attn_oi)
                 pl.store(running_right, [qk_output_row, HEAD_DIM // 2], attn_oi)
 
-    # Interleaved inverse-RoPE frequency rows.
-    rope_cos_il = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32)
-    rope_sin_signed = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32)
-    # Inverse-RoPE lane-swap index.
-    rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs", allow_early_resolve=True) as rope_tid:
-        sw_ones = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
-        sw_idx_f = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
-        sw_col = pl.col_expand_mul(sw_ones, sw_idx_f)
-        sw_dup_i32 = pl.cast(pl.mul(sw_col, 0.5), target_type=pl.INT32, mode="trunc")
-        sw_dup_f = pl.cast(sw_dup_i32, target_type=pl.FP32)
-        sw_lane = pl.sub(sw_col, pl.mul(sw_dup_f, 2.0))
-        sw_swap_f = pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0))
-        rope_swap_idx[0:H_TILE, 0:ROPE_DIM] = pl.cast(sw_swap_f, target_type=pl.INT32)
-
-        cs_ones = pl.full([ROPE_CS_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
-        cs_idx_f = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
-        cs_col = pl.col_expand_mul(cs_ones, cs_idx_f)
-        cs_dup_i32 = pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc")
-        cs_dup_f = pl.cast(cs_dup_i32, target_type=pl.FP32)
-        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)
-        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))
-        cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))
-        for cs_rb in pl.range(rope_cs_blocks):
-            cs_t0 = cs_rb * ROPE_CS_T_TILE
-            cs_cos = pl.cast(freqs_cos[cs_t0 : cs_t0 + ROPE_CS_T_TILE, 0:HALF_ROPE], target_type=pl.FP32)
-            cs_sin = pl.cast(freqs_sin[cs_t0 : cs_t0 + ROPE_CS_T_TILE, 0:HALF_ROPE], target_type=pl.FP32)
-            rope_cos_il[cs_t0 : cs_t0 + ROPE_CS_T_TILE, 0:ROPE_DIM] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
-            cs_sin_il = pl.gather(cs_sin, dim=-1, index=cs_dup_idx)
-            rope_sin_signed[cs_t0 : cs_t0 + ROPE_CS_T_TILE, 0:ROPE_DIM] = pl.mul(cs_sin_il, cs_sign)
-
-    return (
-        attn_mi, attn_li, attn_oi,
-        rope_cos_il, rope_sin_signed, rope_swap_idx,
-        qk_tid, rope_tid,
-    )
+    return attn_mi, attn_li, attn_oi, qk_tid
 
 
 @pl.jit.inline
-def sparse_attn_csa_tp1(
+def _sparse_attn_csa_tp1_prepared(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor,
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -441,8 +415,8 @@ def sparse_attn_csa_tp1(
     idx_topk: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
     position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
     o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
     plan_dep: pl.Scalar[pl.TASK_ID],
     page_rows: pl.constexpr,
@@ -455,23 +429,22 @@ def sparse_attn_csa_tp1(
     Only the first runtime ``t_dim`` rows in each group are valid. The
     returned task ID covers every write to the packed output tensor.
     """
-    (
-        attn_mi, attn_li, attn_oi,
-        rope_cos_il, rope_sin_signed, rope_swap_idx,
-        qk_tid, rope_tid,
-    ) = sparse_attn_csa(
+    attn_mi, attn_li, attn_oi, qk_tid = sparse_attn_csa(
         q, ori_kv, window_swa_indices,
         cmp_kv, cmp_block_table, idx_topk,
-        position_ids, attn_sink, freqs_cos, freqs_sin,
+        position_ids, attn_sink,
         plan_dep, page_rows,
     )
     t_dim = pl.tensor.dim(q, 0)
 
     merge_sink = pl.reshape(attn_sink, [H, 1])
-    with pl.spmd(MERGE_WORKERS, name_hint="merge_norm", deps=[qk_tid, rope_tid]) as merge_tid:
+    with pl.spmd(MERGE_WORKERS, name_hint="merge_norm", deps=[qk_tid, plan_dep]) as merge_tid:
         m_worker = pl.tile.get_block_idx()
-        m_swap = pl.load(rope_swap_idx, [0, 0], [H_TILE, ROPE_DIM])
-        m_swap_f = pl.cast(m_swap, target_type=pl.FP32)
+        m_columns = pl.cast(pl.tile.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
+        m_half = pl.cast(pl.cast(pl.mul(m_columns, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        m_lane = pl.sub(m_columns, pl.mul(m_half, 2.0))
+        m_swap_row = pl.sub(pl.add(m_columns, 1.0), pl.mul(m_lane, 2.0))
+        m_swap_f = pl.col_expand_mul(pl.tile.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0), m_swap_row)
         m_swap_source = pl.add(m_swap_f, NOPE_DIM)
         m_row_ids = pl.tile.arange(0, [1, H_TILE], dtype=pl.INT32)
         m_row_ids_f = pl.cast(m_row_ids, target_type=pl.FP32)
@@ -497,8 +470,8 @@ def sparse_attn_csa_tp1(
 
             # Inverse-RoPE head tile.
             m_rope = n_full[0:H_TILE, NOPE_DIM:HEAD_DIM]
-            m_cos_il = pl.load(rope_cos_il, [m_t, 0], [1, ROPE_DIM])
-            m_sin_signed = pl.load(rope_sin_signed, [m_t, 0], [1, ROPE_DIM])
+            m_cos_il = pl.load(freqs_cos, [m_t, 0], [1, ROPE_DIM])
+            m_sin_signed = pl.neg(pl.load(freqs_sin, [m_t, 0], [1, ROPE_DIM]))
             m_swapped = pl.tile.gather(n_full, m_swap_idx, m_gather_tmp)
             m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
             n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
@@ -513,6 +486,43 @@ def sparse_attn_csa_tp1(
             pl.store(n_pack_second, [n_pack_row_second, 0], o_packed_heads)
 
     return o_packed_heads, merge_tid
+
+
+@pl.jit.inline
+def sparse_attn_csa_tp1(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor,
+    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor,
+    cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    idx_topk: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
+    plan_dep: pl.Scalar[pl.TASK_ID],
+    page_rows: pl.constexpr,
+):
+    """Standalone BF16 half-frequency entry; native CSA already prepares RoPE."""
+    t_dim = pl.tensor.dim(q, 0)
+    cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
+    sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs") as rope_tid:
+        columns = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
+        half = pl.cast(pl.mul(columns, 0.5), target_type=pl.INT32, mode="trunc")
+        lane = pl.sub(columns, pl.mul(pl.cast(half, target_type=pl.FP32), 2.0))
+        sign = pl.sub(pl.mul(lane, 2.0), 1.0)
+        for token in pl.range(t_dim):
+            cos = pl.cast(freqs_cos[token : token + 1, :], target_type=pl.FP32)
+            sin = pl.cast(freqs_sin[token : token + 1, :], target_type=pl.FP32)
+            cos_il[token : token + 1, :] = pl.gather(cos, dim=-1, index=half)
+            sin_signed[token : token + 1, :] = pl.mul(pl.gather(sin, dim=-1, index=half), sign)
+    ready = pl.system.task_dummy(deps=[plan_dep, rope_tid])
+    return _sparse_attn_csa_tp1_prepared(
+        q, ori_kv, window_swa_indices, cmp_kv, cmp_block_table, idx_topk,
+        position_ids, attn_sink, cos_il, sin_signed, o_packed_heads, ready, page_rows,
+    )
 
 
 @pl.jit.inline
@@ -534,8 +544,8 @@ def sparse_attn_csa_tp1_vllm(
     position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
     token_valid: pl.Tensor[[T_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
     o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD, O_GROUP_IN], pl.BF16],
     ready_dep: pl.Scalar[pl.TASK_ID],
 ) -> tuple[
@@ -544,6 +554,7 @@ def sparse_attn_csa_tp1_vllm(
 ]:
     """Run CSA on raw and compressed blocks from separate vLLM page pools."""
     t_dim = pl.tensor.dim(q, 0)
+    s_dim = t_dim // pl.tensor.dim(ori_block_table, 0)
     window_indices = pl.create_tensor([t_dim, WIN], dtype=pl.INT32)
     with pl.spmd(
         CSA_PLAN_WORKERS,
@@ -553,7 +564,7 @@ def sparse_attn_csa_tp1_vllm(
     ) as window_plan_tid:
         worker = pl.tile.get_block_idx()
         for token in pl.range(worker, t_dim, CSA_PLAN_WORKERS):
-            request = token // S
+            request = token // s_dim
             position = pl.cast(pl.read(position_ids, [token, 0]), pl.INDEX)
             valid = pl.read(token_valid, [token])
             window_len = pl.min(position + 1, WIN)
@@ -578,7 +589,7 @@ def sparse_attn_csa_tp1_vllm(
                     pl.cast(physical_row, pl.INT32),
                 )
 
-    output, completion = sparse_attn_csa_tp1(
+    output, completion = _sparse_attn_csa_tp1_prepared(
         q,
         kv_cache_pages,
         window_indices,
@@ -653,8 +664,9 @@ def golden_sparse_attn(tensors):
     o = torch.zeros(tokens, H, HEAD_DIM)
 
     # Per-token sparse attention.
+    seq = tokens // cmp_block_table.shape[0]
     for t in range(tokens):
-        b = t // S
+        b = t // seq
         kv_rows = []
         valid = []
 

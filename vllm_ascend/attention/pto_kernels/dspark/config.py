@@ -246,7 +246,7 @@ DECODE_BATCH = 64                 # B: requests per decode step, per DP rank
 # submits a different count per step would silently read the wrong request's rows.
 # A launcher that forwards unset switches as empty strings makes the get()
 # default unreachable, so fall back on the value rather than on absence.
-DSPARK_SPEC_TOKENS = int(os.environ.get("PTO_DSPARK_SPEC_TOKENS", "") or 7)
+DSPARK_SPEC_TOKENS = int(os.environ.get("PTO_DSPARK_SPEC_TOKENS", "") or 5)
 DECODE_SEQ = 1 + DSPARK_SPEC_TOKENS  # S: tokens the target model verifies per step
 DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
 DECODE_START_POS = 8192
@@ -282,7 +282,7 @@ INT8_AMAX_EPS = 1e-4                      # amax floor: avoids 127/0 on all-zero
 FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax masking)
 
 # Parallelism constants
-TP = 4    # tensor-parallel ranks per DP group
+TP = 1    # tensor-parallel ranks per DP group
 DP = 4    # DP groups per node
 EP = 16   # expert-parallel world size (moe overrides it from --ep)
 

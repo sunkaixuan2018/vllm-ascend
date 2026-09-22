@@ -664,12 +664,15 @@ def indexer_compressor_pool_projected_vllm(
                         ] = state_bytes
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
+    rms_blocks = (tokens + RMS_PAD_TILE - 1) // RMS_PAD_TILE
     with pl.spmd(
-        pl.min(b_dim, RMS_WORKERS),
+        rms_blocks,
         name_hint="indexer_rmsnorm_rope_vllm",
         deps=[pool_tid],
     ) as rms_tid:
-        worker = pl.tile.get_block_idx()
+        block = pl.tile.get_block_idx()
+        row_begin = block * RMS_PAD_TILE
+        rows = pl.min(RMS_PAD_TILE, tokens - row_begin)
         rope_ones = pl.full(
             [RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0,
         )
@@ -689,83 +692,71 @@ def indexer_compressor_pool_projected_vllm(
             pl.sub(pl.add(rope_columns, 1.0), pl.mul(lane, 2.0)),
             target_type=pl.INT32,
         )
-        for request_begin in pl.range(
-            worker * RMS_PAD_TILE,
-            b_dim,
-            pl.min(b_dim, RMS_WORKERS) * RMS_PAD_TILE,
-        ):
-            request_rows = pl.min(RMS_PAD_TILE, b_dim - request_begin)
-            pooled_block = pl.full(
-                [RMS_PAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0,
-            )
-            cos_block = pl.full(
-                [RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0,
-            )
-            sin_block = pl.full(
-                [RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0,
-            )
-            for inner in pl.range(request_rows):
-                request = request_begin + inner
-                token = request * s_dim
-                valid = pl.read(token_valid, [token])
-                position = pl.read(position_ids, [token])
-                if valid != 0 and (position + 1) % COMPRESS_RATIO == 0:
-                    pooled_block[inner : inner + 1, :] = pooled_kv[
-                        token : token + 1, :
-                    ]
-                    cos_block[inner : inner + 1, :] = cos[token : token + 1, :]
-                    sin_block[inner : inner + 1, :] = sin[token : token + 1, :]
-
-            partial_sq = pl.full(
-                [1, RMS_PAD_TILE], dtype=pl.FP32, value=0.0,
-            )
-            for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
-                values = pooled_block[:, k0 : k0 + HEAD_TILE]
-                partial_sq = pl.add(
-                    partial_sq,
-                    pl.reshape(
-                        pl.row_sum(pl.mul(values, values)), [1, RMS_PAD_TILE],
-                    ),
-                )
-            inv_rms = pl.recip(
-                pl.sqrt(
-                    pl.reshape(
-                        pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS),
-                        [RMS_PAD_TILE, 1],
-                    ),
+        pooled_block = pooled_kv[
+            row_begin : row_begin + RMS_PAD_TILE, 0:HEAD_DIM
+        ]
+        cos_block = pl.slice(
+            cos,
+            [RMS_PAD_TILE, ROPE_HEAD_DIM],
+            [row_begin, 0],
+            valid_shape=[rows, ROPE_HEAD_DIM],
+        )
+        sin_block = pl.slice(
+            sin,
+            [RMS_PAD_TILE, ROPE_HEAD_DIM],
+            [row_begin, 0],
+            valid_shape=[rows, ROPE_HEAD_DIM],
+        )
+        partial_sq = pl.full(
+            [1, RMS_PAD_TILE], dtype=pl.FP32, value=0.0,
+        )
+        for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
+            values = pooled_block[:, k0 : k0 + HEAD_TILE]
+            partial_sq = pl.add(
+                partial_sq,
+                pl.reshape(
+                    pl.row_sum(pl.mul(values, values)), [1, RMS_PAD_TILE],
                 ),
             )
-            nope = pooled_block[:, 0:NOPE_HEAD_DIM]
-            nope_gamma = pl.cast(
-                norm_w_2d[:, 0:NOPE_HEAD_DIM], target_type=pl.FP32,
-            )
-            normed_nope = pl.cast(
-                pl.col_expand_mul(pl.row_expand_mul(nope, inv_rms), nope_gamma),
-                target_type=pl.BF16,
-                mode="rint",
-            )
-            rope = pooled_block[:, NOPE_HEAD_DIM:HEAD_DIM]
-            rope_gamma = pl.cast(
-                norm_w_2d[:, NOPE_HEAD_DIM:HEAD_DIM], target_type=pl.FP32,
-            )
-            rope_normed = pl.col_expand_mul(
-                pl.row_expand_mul(rope, inv_rms), rope_gamma,
-            )
-            normed_rope = pl.cast(
-                pl.add(
-                    pl.mul(rope_normed, cos_block),
-                    pl.mul(pl.gather(rope_normed, dim=-1, index=swap), sin_block),
+        inv_rms = pl.recip(
+            pl.sqrt(
+                pl.reshape(
+                    pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS),
+                    [RMS_PAD_TILE, 1],
                 ),
-                target_type=pl.BF16,
-                mode="rint",
-            )
-            normed_kv[
-                request_begin : request_begin + RMS_PAD_TILE, 0:NOPE_HEAD_DIM
-            ] = normed_nope
-            normed_kv[
-                request_begin : request_begin + RMS_PAD_TILE,
-                NOPE_HEAD_DIM:HEAD_DIM,
-            ] = normed_rope
+            ),
+        )
+        nope = pooled_block[:, 0:NOPE_HEAD_DIM]
+        nope_gamma = pl.cast(
+            norm_w_2d[:, 0:NOPE_HEAD_DIM], target_type=pl.FP32,
+        )
+        normed_nope = pl.cast(
+            pl.col_expand_mul(pl.row_expand_mul(nope, inv_rms), nope_gamma),
+            target_type=pl.BF16,
+            mode="rint",
+        )
+        rope = pooled_block[:, NOPE_HEAD_DIM:HEAD_DIM]
+        rope_gamma = pl.cast(
+            norm_w_2d[:, NOPE_HEAD_DIM:HEAD_DIM], target_type=pl.FP32,
+        )
+        rope_normed = pl.col_expand_mul(
+            pl.row_expand_mul(rope, inv_rms), rope_gamma,
+        )
+        normed_rope = pl.cast(
+            pl.add(
+                pl.mul(rope_normed, cos_block),
+                pl.mul(pl.gather(rope_normed, dim=-1, index=swap), sin_block),
+            ),
+            target_type=pl.BF16,
+            mode="rint",
+        )
+        normed_kv[
+            row_begin : row_begin + RMS_PAD_TILE, 0:NOPE_HEAD_DIM
+        ] = normed_nope
+        normed_kv[
+            row_begin : row_begin + RMS_PAD_TILE,
+            NOPE_HEAD_DIM:HEAD_DIM,
+        ] = normed_rope
     return rms_tid, state_commit_tid
 
 
@@ -794,16 +785,16 @@ def indexer_compressor_write_vllm(
     shared_pages_flat = pl.reshape(
         shared_pages, [page_count * VLLM_INDEX_PAGE_ROWS, HEAD_DIM],
     )
-    padded_requests = ((b_dim + RMS_PAD_TILE - 1) // RMS_PAD_TILE) * RMS_PAD_TILE
+    token_blocks = (tokens + RMS_PAD_TILE - 1) // RMS_PAD_TILE
     kv_final = pl.create_tensor([BS_PAD, HEAD_DIM], dtype=pl.FP32)
     with pl.spmd(
-        pl.min((padded_requests + RMS_PAD_TILE - 1) // RMS_PAD_TILE, RMS_WORKERS),
+        token_blocks,
         name_hint="indexer_kv_hadamard_vllm",
         deps=[rms_tid, hadamard_dep],
     ) as hadamard_tid:
         block = pl.tile.get_block_idx()
         row_begin = block * RMS_PAD_TILE
-        rows = pl.min(RMS_PAD_TILE, b_dim - row_begin)
+        rows = pl.min(RMS_PAD_TILE, tokens - row_begin)
         values = pl.slice(
             normed_kv,
             [RMS_PAD_TILE, HEAD_DIM],
@@ -820,8 +811,7 @@ def indexer_compressor_write_vllm(
                 row_begin : row_begin + RMS_PAD_TILE, o0 : o0 + OUT_TILE
             ] = projected
 
-    request_blocks = (b_dim + RMS_PAD_TILE - 1) // RMS_PAD_TILE
-    key_workers = pl.min(request_blocks, COMMIT_WORKERS)
+    key_workers = pl.min(token_blocks, COMMIT_WORKERS)
     scale_values = pl.create_tensor([BS_PAD, 1], dtype=pl.FP32)
     with pl.spmd(
         key_workers,
@@ -829,15 +819,15 @@ def indexer_compressor_write_vllm(
         deps=[hadamard_tid, state_commit_tid],
     ) as key_write_tid:
         worker = pl.tile.get_block_idx()
-        for request_block in pl.range(worker, request_blocks, key_workers):
-            request_begin = request_block * RMS_PAD_TILE
-            request_rows = pl.min(RMS_PAD_TILE, b_dim - request_begin)
+        for token_block in pl.range(worker, token_blocks, key_workers):
+            token_begin = token_block * RMS_PAD_TILE
+            token_rows = pl.min(RMS_PAD_TILE, tokens - token_begin)
             row_fp32 = pl.cast(
                 pl.cast(
                     pl.slice(
                         kv_final,
                         [RMS_PAD_TILE, HEAD_DIM],
-                        [request_begin, 0],
+                        [token_begin, 0],
                     ),
                     target_type=pl.BF16,
                     mode="rint",
@@ -868,7 +858,7 @@ def indexer_compressor_write_vllm(
                 pl.recip(quant_scale_row), [RMS_PAD_TILE, 1],
             )
             scale_values[
-                request_begin : request_begin + RMS_PAD_TILE, 0:1
+                token_begin : token_begin + RMS_PAD_TILE, 0:1
             ] = dequant_scale
             scaled = pl.row_expand_mul(row_fp32, quant_scale)
             key_i8 = pl.cast(
@@ -880,9 +870,9 @@ def indexer_compressor_write_vllm(
                 target_type=pl.INT8,
                 mode="trunc",
             )
-            for inner in pl.range(request_rows):
-                request = request_begin + inner
-                token = request * s_dim
+            for inner in pl.range(token_rows):
+                token = token_begin + inner
+                request = token // s_dim
                 valid = pl.read(token_valid, [token])
                 position = pl.read(position_ids, [token])
                 if valid != 0 and (position + 1) % COMPRESS_RATIO == 0:
@@ -901,7 +891,7 @@ def indexer_compressor_write_vllm(
                             physical_row : physical_row + 1, 0:HEAD_DIM
                         ] = key_i8[inner : inner + 1, 0:HEAD_DIM]
                         kv[token : token + 1, :] = kv_final[
-                            request : request + 1, :
+                            token : token + 1, :
                         ]
 
     with pl.at(
@@ -909,8 +899,8 @@ def indexer_compressor_write_vllm(
         name_hint="indexer_scale_write_vllm",
         deps=[key_write_tid],
     ) as scale_write_tid:
-        for request in pl.range(b_dim):
-            token = request * s_dim
+        for token in pl.range(tokens):
+            request = token // s_dim
             valid = pl.read(token_valid, [token])
             position = pl.read(position_ids, [token])
             if valid != 0 and (position + 1) % COMPRESS_RATIO == 0:
@@ -935,7 +925,7 @@ def indexer_compressor_write_vllm(
                     pl.tile.write(
                         scales,
                         [0, intra],
-                        pl.cast(pl.read(scale_values, [request, 0]), pl.FP16),
+                        pl.cast(pl.read(scale_values, [token, 0]), pl.FP16),
                     )
                     tail_out = pl.reinterpret_view(
                         scales, pl.INT8, shape=[2, HEAD_DIM],

@@ -657,6 +657,7 @@ def q_proj_rope(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    rope_ready_dep: pl.Scalar[pl.TASK_ID],
 ):
     """Q LoRA, RMSNorm, quantization, and RoPE over bounded dense tiles."""
     qr_i8_matmul = pl.create_tensor([QPROJ_T_PAD, Q_LORA], dtype=pl.INT8)
@@ -673,7 +674,7 @@ def q_proj_rope(
         qr_scale_pad_store,
         q_seq_deps,
     )
-    q_seq_dep = pl.system.task_dummy(deps=[q_seq_deps[0]])
+    q_seq_dep = pl.system.task_dummy(deps=[q_seq_deps[0], rope_ready_dep])
     q_proj_q(
         x, wq_b, wq_b_scale, rope_cos_il, rope_sin_signed, rope_swap_idx, q,
         qr_i8_matmul, qr_scale_pad_store, q_seq_dep,
@@ -942,6 +943,7 @@ def qkv_proj_rope(
         q,
         qr,
         qr_scale,
+        late_dep,
     )
     kv_proj_rope(
         x,
@@ -1030,6 +1032,7 @@ def q_kv_split_test(
     q_sin_signed = pl.create_tensor([SPLIT_T_LOCAL, ROPE_DIM], dtype=pl.FP32)
     q_swap_idx = pl.create_tensor([SPLIT_T_LOCAL, ROPE_DIM], dtype=pl.INT32)
     rope_prepare(rope_cos_local, rope_sin_local, q_cos_il, q_sin_signed, q_swap_idx)
+    late_dep = pl.system.task_dummy(deps=[])
     q_proj_rope(
         x_local,
         wq_a,
@@ -1042,14 +1045,13 @@ def q_kv_split_test(
         q,
         qr,
         qr_scale,
+        late_dep,
     )
 
     kv_cos_il = pl.create_tensor([SPLIT_T_FULL, ROPE_DIM], dtype=pl.FP32)
     kv_sin_signed = pl.create_tensor([SPLIT_T_FULL, ROPE_DIM], dtype=pl.FP32)
     kv_swap_idx = pl.create_tensor([SPLIT_T_FULL, ROPE_DIM], dtype=pl.INT32)
     rope_prepare(rope_cos_full, rope_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
-    # Standalone: no rms_norm producer to fence.
-    late_dep = pl.system.task_dummy(deps=[])
     kv_proj_rope(
         x_full,
         wkv,

@@ -1,13 +1,92 @@
 # PyPTO CSA 算子接入 vLLM 的对接说明
 
-> **Run 062 更新（2026-09-21）**：本文第 2～8 节记录的是旧 46 参数转换层及其性能，
+> **Run 062 更新（2026-09-22）**：本文第 2～8 节记录的是旧 46 参数转换层及其性能，
 > 仅作为问题背景保留，不再描述当前工作树。当前实现已切换为 lib 提供的 40 参数
 > vLLM-native attention-only ABI：主 state、raw KV、compressed KV 分别直接绑定
 > `[N,16,2048] FP32`、`[N,128,1,512] BF16`、`[N,128,1,512] BF16`
-> 三份独立物理页 allocation；inner state/index key/FP16 scale 直接绑定同一份
+> 三个连续 view；主 state 与 compressed KV 共用物理 allocation，raw KV 独立；
+> inner state/index key/FP16 scale 直接绑定同一份
 > `[N,130,128] INT8` 物理页；adapter 不再构造私有 state ring、repage cache 或五类
 > slot mapping。本文将在真实 eager/ACLGraph/performance A/B 完成后整体改写；在此之前不要复制下文的
 > 46 参数 `ARG_ORDER` 或旧性能数字作为新接口说明。
+
+### 当前工作树：直接绑定真实 token 与常驻 RoPE
+
+- 40 个参数的数量和顺序不变；原 compiled cache 必须重建。
+- TP1 的容量为 B=64、S=6；实际输入按 request-major 排列，`T = runtime_batch * runtime_seq`。
+  S=1 不再扩成六份；S=6 提交六个真实 token。请求之间使用相同的 `runtime_seq`，
+  padding/无效尾行由 `token_valid` 表达，不支持无映射的变长 query 拼接。
+- `x_normed` 和 `attn_out` 为实际 `[T,4096] BF16` 连续 view；直接写调用方 output，
+  不再在返回后 index-select。
+- `position_ids` 为原生连续 `[T] INT64`，入口的既有 RoPE task 内转换为内部 INT32。
+- `freqs_cos/sin`、`cmp_freqs_cos/sin` 改为常驻 `[rope_rows,64] FP32` 的 interleaved 全表，
+  直接 view vLLM `_ROPE_STATE.static_cache`，不新建全表。RoPE 行轴与 T 独立。
+  普通 RoPE 读取 `position`；ratio4 边界读取 `position + 1 - 4`。
+  adapter 不再进行 BF16 转换、半频率 concat、boundary Cumsum 或 compact-row gather。
+- 原有 `csa_vllm_rope_interleave` task 一次生成消费者共用的 token-local 行；
+  QKV 和 sparse inverse RoPE 不再各自启动一次转换 task。
+- 仍有动态 `token_valid` 的构造。这里只移除了重复数据/形状转换，不声称所有准备开销归零。
+- 验证覆盖 PyPTO 算子、host payload、kernel numerical golden，以及下文的单层
+  `impl.forward()` A/B；不代表完整 vLLM serving 已验收。
+- 当前 host payload、S1 回归，以及 TP1/S6/128K 的 B=4/8/16/24/32/40 单卡矩阵
+  均已通过。S1 的单列 fillpad UB 越界已修复并通过设备校验。
+- 已补 cold-start、全 inactive、部分有效尾行、非零 compressor/indexer，以及设备上
+  main state/compressed KV 共用一份 allocation 的按字节校验。B4/S1、B4/S6、B40/S6
+  的128K trace 均通过输出/cache/state检查，已下载到本地。
+- 测试使用 PyPTO 机器的 dsj-pypto-dev、PTOAS0.63；必须显式传入队列卡号：
+  `task-submit --device auto --ptoas 0.63 --max-time 0 --run "... csa_tp1_s6_gate.py --batch 4 --device {}"`。
+  不传卡号的旧并发提交结果不计入本次验收。详细任务号、产物和瓶颈数据见 Run062 §15.8–15.9。
+- 单步kernel golden使用合成输入；不代表真实请求激活回放、多轮持久cache或
+  旧/新版本同负载性能A/B已完成；截图旧数字不能直接作为新版本收益基线。
+
+### 单层 native / PTO A/B 状态（2026-09-22）
+
+使用真实checkpoint的第2层attention权重、固定合成hidden states/history cache，
+只调用单层CSA，不加载整模型、不包含外部HC-pre/输入RMS/HC-post/MoE。
+native为 `AscendDSAImpl.forward()`；PTO为 `build_args()` 加注册的attention kernel。
+
+- B4/S1/128、B4/S6/128、B4/S6/128K均能执行；输出尾部哨兵和position输入不变检查通过。
+- **native/PTO精度比较尚未通过**：output相对L2分别约1.5264%、1.5391%、1.8601%，
+  index key也有差异。不能将kernel自身golden通过表述成真实native结果完全一致。
+- TP1 output projection的最后一个不足8行的tile已用 `pl.set_validshape` 限制写回；
+  修复了S1/B4时越界覆盖相邻buffer的问题，但未消除上述数值差异。
+- 按性能专项口径，另测B4/S6/128K；`start_pos=131066`，最后位置131071，
+  visible length为131072。独立ACLGraph、同一张卡、6轮×50次重放，报告轮均值的中位数。
+  首次编译、权重转换、metadata构造、cache恢复、graph capture及profiler均不计入。
+
+| 路径 | 单次24-query forward（μs） |
+| --- | ---: |
+| native `impl.forward()` | 762.869 |
+| PTO完整调用（含adapter） | 1861.026 |
+| PTO参数预绑定、仅kernel | 1847.819 |
+| 仅adapter准备，独立图 | 39.268 |
+
+该配置下PTO完整时延约为native的2.44倍。独立分项各有图下发开销，不能直接相加。
+主要差距在kernel/runtime路径，而非输入准备；尚未通过该trace进一步隔离PTO内部各阶段。
+native的 `multistream_dsa_preprocess` 和 `multistream_dsv4_dsa_overlap` 均关闭，
+不宣称这是native所有调优配置中的最优结果。此性能记录不构成精度验收。
+
+可复用的测试入口：
+
+- `tools/pto_csa/kernel/csa_tp1_s6_gate.py`：单卡kernel golden、inactive/tail、共享页测试；
+  需要将pypto-lib（含golden）及其dspark model helpers加入 `PYTHONPATH`，
+  也可用 `PYPTO_LIB_MODEL_DIR` 指定model helpers。
+- `tools/pto_csa/kernel/impl_forward_ab.py`：真实权重native/PTO单步对比；
+  `--performance` 切换为固定B4/S6/128K的ACLGraph微基准，`--perf-profile` 另采trace。
+  环境需要匹配的vLLM、vLLM Ascend原生算子、torch-npu与PyPTO kernel-mode支持。
+  本次环境使用Python3.11、Torch2.10.0 CPU、torch-npu2.10.0、vLLM0.20.2、
+  当前vLLM Ascend源码及新编译的native算子、CANN9.0.0、PTOAS0.63。
+
+在已加载正确环境、仓库根目录下，替换checkpoint路径后运行：
+
+```bash
+export PTO_CSA=0 PTO_ATTN_TP=1 PTO_DSPARK_SPEC_TOKENS=5 PYPTO_CACHE=1
+unset ASCEND_LAUNCH_BLOCKING PTO_ATTN_COMPARE PTO_CSA_PROBE
+task-submit --device auto --ptoas 0.63 --max-time 900 --run \
+  "python tools/pto_csa/kernel/impl_forward_ab.py --device {} --extension-dir ./vllm_ascend --model /path/to/checkpoint --out-dir build_output/impl-perf --batch 4 --seq 6 --start-pos 131066 --steps 1 --performance --perf-rounds 6 --perf-iterations 50 --perf-profile"
+```
+
+测试不会自动安装依赖或重置设备。多步状态、真实服务请求以及完整数值闭环仍待验证。
 
 这条分支把 DeepSeek-V4 某一层的 `attention.forward` 整段换成 PyPTO 写的 CSA 算子,
 在 vLLM 的真实推理服务路径上跑。本文给 pypto-lib 侧同事看,不假设读者了解 vLLM 这边。

@@ -10,19 +10,27 @@ import types
 
 import torch
 
-sys.argv = [sys.argv[0], "--tp", "4"]
+sys.argv = [sys.argv[0], "--tp", "1"]
 
 import vllm_ascend.attention.pto_attn as pa  # noqa: E402
 
 # torch_npu's format cast is a device op; on CPU the identity is the right stand-in.
 pa._to_nd = lambda w: w
 
-from vllm_ascend.attention.pto_kernels.dspark import decode_csa as K  # noqa: E402
 from vllm_ascend.attention.pto_kernels.dspark import config as C  # noqa: E402
+from vllm_ascend.attention.pto_kernels.dspark import decode_csa as K  # noqa: E402
 
 M = C.FLASH
 D = M.hidden_size
-NREQ, HOST_SEQ = 4, 1
+TARGET_BATCHES = (4, 8, 16, 24, 32, 40)
+NREQ = int(os.environ.get("TEST_BATCH", "4"))
+HOST_SEQ = int(os.environ.get("TEST_SEQ", "1"))
+ROPE_ROWS = 1024
+rope_cos = torch.randn(ROPE_ROWS, 64)
+rope_sin = torch.randn(ROPE_ROWS, 64)
+pa._native_rope_tables = lambda layer: (rope_cos, rope_sin)
+if NREQ not in TARGET_BATCHES:
+    raise ValueError(f"TEST_BATCH must be one of {TARGET_BATCHES}, got {NREQ}")
 fails = []
 
 
@@ -93,11 +101,12 @@ class Impl:
 
 
 def md(page, ncols, nrows, cos_key):
-    pos = torch.arange(NREQ, dtype=torch.int32) * 7 + 300
+    starts = torch.arange(NREQ, dtype=torch.int64) * 7 + 300
+    pos = (starts[:, None] + torch.arange(HOST_SEQ)).reshape(-1)
     o = types.SimpleNamespace()
     o.input_positions = pos
     o.block_table = torch.arange(NREQ * ncols, dtype=torch.int32).view(NREQ, ncols) + 1
-    o.seq_lens = pos.to(torch.int32) + 1
+    o.seq_lens = (starts + HOST_SEQ).to(torch.int32)
     sm = torch.stack([torch.arange(NREQ) % nrows, torch.arange(NREQ) % page], 1).to(torch.int32)
     o.slot_mapping = sm
     t = torch.randn(NREQ, 1, 1, 64)
@@ -160,11 +169,26 @@ kvc = (
     index_key,
     index_scale,
 )
-hs = torch.randn(NREQ, D).to(torch.bfloat16)
+hs = torch.randn(NREQ * HOST_SEQ, D).to(torch.bfloat16)
+output = torch.empty_like(hs)
 
 print("== build_args ==")
+check("TP1 specialization", K.TP_SIZE == 1, str(K.TP_SIZE))
+check("S=6 specialization", K.S == 6, str(K.S))
+check("B=64 capacity", K.B == 64, str(K.B))
+check("T=384 capacity", K.T == 384 and K.T_PAD == 384, f"{K.T}/{K.T_PAD}")
+check(
+    "target runtime batches fit",
+    all(
+        batch <= K.B
+        and batch * K.S <= K.T
+        and (batch * K.S) % 4 == 0
+        for batch in TARGET_BATCHES
+    ),
+    str([(batch, batch * K.S) for batch in TARGET_BATCHES]),
+)
 try:
-    args, plan = pa.build_args(impl, hs, kvc, metas, HOST_SEQ, L)
+    args, plan = pa.build_args(impl, hs, kvc, metas, HOST_SEQ, L, output=output)
     check("returned 40", len(args) == 40, str(len(args)))
 except Exception:
     import traceback
@@ -174,12 +198,11 @@ except Exception:
     sys.exit(1)
 
 print("== shapes vs the kernel signature ==")
-# T_DYN is a dynamic axis, so the runtime token count is n_real * S, not the
-# module's compile-time T.
-RT = NREQ * K.S
+# Runtime rows follow the payload, not the kernel's maximum S capacity.
+RT = NREQ * HOST_SEQ
 want = {
     "x_normed": [RT, D], "attn_out": [RT, D],
-    "freqs_cos": [RT, 64], "cmp_freqs_cos": [RT, 64],
+    "freqs_cos": [ROPE_ROWS, 64], "cmp_freqs_cos": [ROPE_ROWS, 64],
     "position_ids": [RT], "token_valid": [RT],
     "compress_state_pages": [64, 16, main_state_dim],
     "kv_cache_pages": [64, 128, 1, K.HEAD_DIM],
@@ -225,24 +248,37 @@ check("compressed KV aliases its parent",
       by["cmp_kv_pages"].data_ptr() == cmp_parent.data_ptr())
 check("main state and compressed KV share pages",
       by["compress_state_pages"].data_ptr() == by["cmp_kv_pages"].data_ptr())
+check("input rows alias vLLM", by["x_normed"].data_ptr() == hs.data_ptr())
+check("output rows alias vLLM", by["attn_out"].data_ptr() == output.data_ptr())
+check("positions alias vLLM INT64", by["position_ids"].data_ptr() == metas[0].decode.input_positions.data_ptr()
+      and by["position_ids"].dtype == torch.int64)
+check("RoPE aliases persistent FP32 table", by["freqs_cos"].data_ptr() == rope_cos.data_ptr()
+      and by["freqs_cos"].dtype == torch.float32)
+check("compressed RoPE reuses persistent table", by["cmp_freqs_cos"].data_ptr() == rope_cos.data_ptr())
 
 print("== contiguity (the binding rejects anything else) ==")
 bad = [n for n, a in by.items() if not a.is_contiguous()]
 check("all contiguous", not bad, str(bad))
 
-print("== padding lanes are inert ==")
-valid = by["token_valid"].view(NREQ, K.S)
-check("first lane valid", bool((valid[:, 0] == 1).all()))
-check("later lanes invalid", bool((valid[:, 1:] == 0).all()))
+print("== only actual token rows ==")
+valid = by["token_valid"].view(NREQ, HOST_SEQ)
+check("all real lanes valid", bool((valid == 1).all()))
+check("no rectangular repetition", by["x_normed"].shape[0] == hs.shape[0])
 
 print("== graph-padded request is inert ==")
 # vLLM pads a size-3 replay to the size-4 descriptor by filling the last raw
 # block-table row with null block 0.  That request must not write any shared page.
 metas[-1].decode.block_table[-1].zero_()
 padded_args, _ = pa.build_args(impl, hs, kvc, metas, HOST_SEQ, L)
-padded = dict(zip(pa.ARG_ORDER, padded_args))["token_valid"].view(NREQ, K.S)
-check("three live requests stay active", bool((padded[:3, 0] == 1).all()))
-check("padded request is inactive", bool((padded[3] == 0).all()))
+padded = dict(zip(pa.ARG_ORDER, padded_args))["token_valid"].view(NREQ, HOST_SEQ)
+check("live requests stay active", bool((padded[:-1, 0] == 1).all()))
+check("padded request is inactive", bool((padded[-1] == 0).all()))
+
+metas[0].decode.seq_lens[0] -= 1
+tail_args, _ = pa.build_args(impl, hs, kvc, metas, HOST_SEQ, L)
+tail_valid = dict(zip(pa.ARG_ORDER, tail_args))["token_valid"].view(NREQ, HOST_SEQ)
+check("invalid tail is masked", tail_valid[0, -1].item() == 0)
+check("earlier valid lanes preserved", bool((tail_valid[0, :-1] == 1).all()))
 
 print()
 print("FAILED:" if fails else "ALL PASS", fails or "")

@@ -25,14 +25,14 @@ import torch
 # --- kernel import -----------------------------------------------------------
 # decode_csa fixes its TP specialization at import time from sys.argv, which a
 # vLLM process never carries. Inject it so B = DECODE_BATCH // TP and T = B * S
-# land on the intended shape instead of the module's own default of 2.
+# land on the intended shape instead of the module's own default of 1.
 def _env_int(name: str, default: int) -> int:
     """The launcher forwards unset switches as empty strings, so a present-but-empty
     variable has to fall back the same way an absent one does."""
     return int(os.environ.get(name, "") or default)
 
 
-_TP = _env_int("PTO_ATTN_TP", 4)
+_TP = _env_int("PTO_ATTN_TP", 1)
 
 
 def _import_kernel():
@@ -205,43 +205,25 @@ def prepare_weights(impl):
 # --- per-step derivation: everything below must stay device-only ------------
 
 
-def _rope_to_pto(t: torch.Tensor) -> torch.Tensor:
-    """vLLM's interleaved RoPE table -> the kernel's 'first half real, second half copied'.
+def _native_rope_tables(layer: str):
+    """Alias the layer's persistent, interleaved FP32 vLLM RoPE tables.
 
-    vLLM emits ``[c0, c0, c1, c1, ...]`` over 64 lanes, so only 32 frequencies are
-    distinct; the kernel reads ``[:, :HALF_ROPE]`` and expects those 32 followed by
-    a copy of themselves.
+    Do not use the per-step proxy: compressed rows there are compacted by
+    boundary. The kernel can address the same static table by absolute position.
     """
-    flat = t.reshape(t.shape[0], -1)
-    uniq = flat[:, 0::2][:, :32]
-    return torch.cat([uniq, uniq], dim=1).to(torch.bfloat16)
+    from vllm_ascend.ops.rope_dsv4 import _ROPE_STATE
 
-
-def _compressed_rows(positions: torch.Tensor, seq: int):
-    """Which compressed row each token maps to, and whether it is a boundary.
-
-    The rectangular CSA input repeats one host decode token ``seq`` times. vLLM
-    packs only boundary requests, in request order. Count boundaries on the host
-    request axis first, then expand the packed-row ordinal to the rectangle.
-    """
-    if seq <= 0 or positions.shape[0] % seq:
-        raise NativeLayoutError(
-            f"token rows {positions.shape[0]} are not divisible by seq={seq}"
-        )
-    request_count = positions.shape[0] // seq
-    host_rows = torch.arange(request_count, device=positions.device) * seq
-    host_positions = positions.long().index_select(0, host_rows)
-    host_boundary = ((host_positions + 1) % COMPRESS_RATIO) == 0
-    host_row = (torch.cumsum(host_boundary.long(), dim=0) - 1).clamp_min(0)
-    request = torch.div(
-        torch.arange(positions.shape[0], device=positions.device),
-        seq,
-        rounding_mode="floor",
-    )
-    return (
-        host_boundary.index_select(0, request),
-        host_row.index_select(0, request),
-    )
+    try:
+        config_key, _ = _ROPE_STATE.layer_info[layer]
+        cos, sin = _ROPE_STATE.static_cache[config_key]
+    except KeyError as error:
+        raise NativeLayoutError(f"no persistent RoPE table registered for {layer}") from error
+    for name, table in (("cos", cos), ("sin", sin)):
+        if table.dtype != torch.float32 or not table.is_contiguous() or table.shape[-1] != 64:
+            raise NativeLayoutError(f"native RoPE {name} must be contiguous FP32 with 64 columns")
+    if cos.shape != sin.shape:
+        raise NativeLayoutError("native RoPE cos/sin shapes differ")
+    return cos.view(-1, 64), sin.view(-1, 64)
 
 
 _DEBUG_REFUSED = set()
@@ -359,27 +341,7 @@ def _full_page_view(cache: torch.Tensor, rows: int, row_shape: tuple[int, ...]):
     return view
 
 
-def rectangular(n_real: int, kernel_seq: int, device):
-    """Where each of the kernel's T slots takes its data from.
-
-    The kernel's token-to-request map is a compile-time ``t // S``
-    (decode_sparse_attn_csa.py:202), and S cannot simply be lowered to match a
-    host that submits one token per request: T_PAD would drop below the 128-row
-    O-B tile and decode_o_proj refuses to build. So a host token occupies slot
-    ``r * S`` and the other S-1 slots of that request are padding, kept inert by
-    the explicit ``token_valid`` input.
-
-    Returns ``(src, real)``: ``src[t]`` is the host row slot ``t`` reads, and
-    ``real[t]`` marks the slots that are not padding.
-    """
-    t = n_real * kernel_seq
-    idx = torch.arange(t, device=device)
-    req = torch.div(idx, kernel_seq, rounding_mode="floor")
-    real = (idx - req * kernel_seq) == 0
-    return req, real
-
-
-def build_args(impl, hidden_states, kv_cache, metadata_list, seq: int, layer: str):
+def build_args(impl, hidden_states, kv_cache, metadata_list, seq: int, layer: str, output=None):
     """Bind one decode step to the kernel's native-layout arguments.
 
     ``metadata_list`` is what ``filter_metadata`` returns for a ratio-4 layer:
@@ -392,10 +354,6 @@ def build_args(impl, hidden_states, kv_cache, metadata_list, seq: int, layer: st
         raise NativeLayoutError(
             f"layer must be the layer's name, got {type(layer).__name__}"
         )
-    if seq != 1:
-        raise NativeLayoutError(
-            f"native CSA currently requires one host token per request, got seq={seq}"
-        )
     if len(metadata_list) != 5 or len(kv_cache) != 6:
         raise NativeLayoutError(
             f"ratio-4 CSA requires 5 metadata groups and 6 cache views, got "
@@ -404,19 +362,20 @@ def build_args(impl, hidden_states, kv_cache, metadata_list, seq: int, layer: st
     if any(m.decode is None for m in metadata_list):
         raise NativeLayoutError("native CSA only accepts decode metadata")
     kcsa, _ = kernel()
+    if not 1 <= seq <= kcsa.S:
+        raise NativeLayoutError(f"native CSA requires 1..{kcsa.S} tokens per request, got seq={seq}")
     cmp_md, cst_md, ist_md, idx_md, swa_md = (m.decode for m in metadata_list)
     cmp_kv_c, swa_kv_c, state_c, ist_c, idx_k_c, idx_s_c = kv_cache
 
-    # The RoPE proxy resolves by layer name and quietly returns another proxy for a
-    # non-string key, so the name has to come from the wrapper, not the impl.
     host_pos = metadata_list[0].decode.input_positions
+    if host_pos.dtype != torch.int64 or host_pos.ndim != 1 or not host_pos.is_contiguous():
+        raise NativeLayoutError("input_positions must be contiguous INT64 token rows")
     if host_pos.shape[0] % seq:
         raise NativeLayoutError(
             f"position rows {host_pos.shape[0]} are not divisible by seq={seq}"
         )
     n_real = host_pos.shape[0] // seq            # graph descriptor request rows
-    ks = kcsa.S                                  # the kernel's compile-time S
-    if n_real > kcsa.B:
+    if not 1 <= n_real <= kcsa.B:
         raise NativeLayoutError(
             f"{n_real} requests exceed the kernel's B={kcsa.B}"
         )
@@ -426,11 +385,9 @@ def build_args(impl, hidden_states, kv_cache, metadata_list, seq: int, layer: st
             f"{host_pos.shape[0]}"
         )
 
-    src, real = rectangular(n_real, ks, host_pos.device)
-    b, t = n_real, n_real * ks
-    pos = host_pos.index_select(0, src * seq)    # [T], padding repeats its request
-    host_rows = torch.arange(b, device=host_pos.device) * seq
-    host_positions = host_pos.index_select(0, host_rows).long()
+    b, t = n_real, host_pos.shape[0]
+    pos = host_pos
+    host_positions = pos.view(b, seq)
     raw_logical_page = torch.div(
         host_positions, VLLM_PAGE, rounding_mode="floor",
     )
@@ -441,10 +398,17 @@ def build_args(impl, hidden_states, kv_cache, metadata_list, seq: int, layer: st
         min=0, max=swa_md.block_table.shape[1] - 1,
     )
     raw_pages = swa_md.block_table[:b].gather(
-        1, raw_logical_page.reshape(b, 1),
-    ).reshape(b)
-    host_valid = raw_page_in_range & (raw_pages > 0)
-    token_valid = real & host_valid.index_select(0, src * seq)
+        1, raw_logical_page,
+    )
+    rope_cos, rope_sin = _native_rope_tables(layer)
+    if cmp_md.seq_lens.dtype != torch.int32 or not cmp_md.seq_lens.is_contiguous():
+        raise NativeLayoutError("seq_lens must be contiguous INT32 request rows")
+    seq_lens = cmp_md.seq_lens[:b]
+    token_valid = (
+        raw_page_in_range & (raw_pages > 0)
+        & (host_positions < rope_cos.shape[0])
+        & (host_positions < seq_lens.view(b, 1))
+    ).reshape(t)
 
     def native_table(name: str, table: torch.Tensor) -> torch.Tensor:
         if table.dtype != torch.int32:
@@ -453,7 +417,9 @@ def build_args(impl, hidden_states, kv_cache, metadata_list, seq: int, layer: st
             raise NativeLayoutError(
                 f"{name} has {table.shape[0]} requests, expected at least {b}"
             )
-        return table[:b].contiguous()
+        if not table.is_contiguous():
+            raise NativeLayoutError(f"{name} must be contiguous; no per-step copy is made")
+        return table[:b]
 
     expected_dtypes = {
         "main state": (state_c, torch.float32),
@@ -468,22 +434,15 @@ def build_args(impl, hidden_states, kv_cache, metadata_list, seq: int, layer: st
             raise NativeLayoutError(f"{name} must be {dtype}, got {tensor.dtype}")
 
     a = dict(prepare_weights(impl))
-    a["x_normed"] = hidden_states.index_select(0, src * seq).to(torch.bfloat16)
-    a["attn_out"] = torch.empty(t, hidden_states.shape[-1],
-                                dtype=torch.bfloat16, device=hidden_states.device)
+    a["x_normed"] = hidden_states[:t]
+    a["attn_out"] = output[:t] if output is not None else torch.empty_like(a["x_normed"])
+    for name in ("x_normed", "attn_out"):
+        tensor = a[name]
+        if tensor.dtype != torch.bfloat16 or not tensor.is_contiguous() or tensor.shape != (t, kcsa.D):
+            raise NativeLayoutError(f"{name} must be contiguous BF16 [{t}, {kcsa.D}]")
 
-    # RoPE: vLLM keeps the compressed table packed by boundary row.
-    _, row = _compressed_rows(pos, ks)
-    # The per-token tables are indexed by host row, so they follow the same
-    # rectangle as x_normed; the compressed ones are indexed by boundary row and
-    # are expanded through `row` below.
-    a["freqs_cos"] = _rope_to_pto(_pick(cmp_md.cos, layer)).index_select(0, src * seq)
-    a["freqs_sin"] = _rope_to_pto(_pick(cmp_md.sin, layer)).index_select(0, src * seq)
-    cc = _rope_to_pto(_pick(cmp_md.compress_cos, layer))
-    cs = _rope_to_pto(_pick(cmp_md.compress_sin, layer))
-    rc = row.clamp(max=cc.shape[0] - 1)
-    a["cmp_freqs_cos"] = cc.index_select(0, rc)
-    a["cmp_freqs_sin"] = cs.index_select(0, rc)
+    a["freqs_cos"], a["freqs_sin"] = rope_cos, rope_sin
+    a["cmp_freqs_cos"], a["cmp_freqs_sin"] = rope_cos, rope_sin
 
     # Main state and compressed KV are different views of one physical page
     # pool; raw sliding KV uses a separate allocation.
@@ -553,26 +512,11 @@ def build_args(impl, hidden_states, kv_cache, metadata_list, seq: int, layer: st
     a["index_block_table"] = native_table(
         "index block table", idx_md.block_table,
     )
-    a["position_ids"] = pos.to(torch.int32)
+    a["position_ids"] = pos
     a["token_valid"] = token_valid.to(torch.int32)
-    a["kv_seq_lens"] = cmp_md.seq_lens.to(torch.int32)[:b]
+    a["kv_seq_lens"] = seq_lens
 
-    return [a[name] for name in ARG_ORDER], (pos, ks, n_real)
-
-
-def _pick(table, layer):
-    """The RoPE tables are keyed by layer, behind a dict or a RopeDataProxy.
-
-    The proxy resolves a layer name to its registered cache group and hands back
-    the tensor; only a layer registered for several groups gets a dict, and the
-    DSA layers are single-group.
-    """
-    if isinstance(table, torch.Tensor):
-        return table
-    value = table[layer]
-    if isinstance(value, dict):
-        value = next(iter(value.values()))
-    return value
+    return [a[name] for name in ARG_ORDER], (pos, seq, n_real)
 
 
 # --- one-shot comparison -----------------------------------------------------
@@ -626,18 +570,22 @@ def audit_shared_pool_ownership(
     ).reshape(-1)
     active = raw_in_range & (raw_current_page > 0)
 
-    history = positions.reshape(-1, 1) - torch.arange(
-        8, device=positions.device,
+    # Include both the old seven-row history and every submitted token. An S=6
+    # step can cross an 8-row state page or a 128-row cache page.
+    history = positions.reshape(-1, 1) + torch.arange(
+        -7, seq, device=positions.device,
     ).reshape(1, -1)
     state_valid = (history >= 0) & active.reshape(-1, 1)
+    state_valid &= history < cmp_md.seq_lens[:n_real].reshape(-1, 1)
     state_columns = torch.div(
         history.clamp_min(0), VLLM_STATE_PAGE, rounding_mode="floor",
     ).clamp(max=ist_md.block_table.shape[1] - 1)
     inner_ids = ist_md.block_table[:n_real].gather(1, state_columns)
     inner_ids = inner_ids.masked_select(state_valid & (inner_ids > 0))
 
+    last_positions = torch.minimum(positions + seq - 1, cmp_md.seq_lens[:n_real] - 1)
     compressed_rows = torch.div(
-        positions + 1, COMPRESS_RATIO, rounding_mode="floor",
+        last_positions + 1, COMPRESS_RATIO, rounding_mode="floor",
     ).clamp_min(0)
     index_page_count = torch.div(
         compressed_rows + VLLM_PAGE - 1,
@@ -670,13 +618,12 @@ def audit_shared_pool_ownership(
     state_ids = state_ids.masked_select(state_valid & (state_ids > 0))
 
     raw_first = (positions - 127).clamp_min(0)
-    raw_columns = torch.stack(
-        (
-            torch.div(raw_first, VLLM_PAGE, rounding_mode="floor"),
-            torch.div(positions, VLLM_PAGE, rounding_mode="floor"),
-        ),
-        dim=1,
-    ).clamp(min=0, max=swa_md.block_table.shape[1] - 1)
+    first_raw_page = torch.div(raw_first, VLLM_PAGE, rounding_mode="floor")
+    raw_columns = first_raw_page[:, None] + torch.arange(
+        (128 + seq + VLLM_PAGE - 2) // VLLM_PAGE + 1, device=positions.device,
+    )[None, :]
+    raw_columns = torch.minimum(raw_columns, torch.div(last_positions, VLLM_PAGE, rounding_mode="floor")[:, None])
+    raw_columns = raw_columns.clamp(min=0, max=swa_md.block_table.shape[1] - 1)
     raw_ids = swa_md.block_table[:n_real].gather(1, raw_columns)
     raw_ids = raw_ids.masked_select(active.reshape(-1, 1) & (raw_ids > 0))
 
@@ -831,8 +778,7 @@ def substitute(self, hidden_states, kv_cache, metadata_list, output) -> bool:
     """Run the kernel in place of the native attention and publish its result.
 
     Unlike :func:`compare_once` this owns the step: the kernel directly updates
-    vLLM's live state and cache pages, and the padding rows of the rectangle are
-    dropped on the way out.
+    vLLM's live state and cache pages, and writes directly to its output buffer.
     """
     impl = self.dsa_attn.impl
     ratio = getattr(impl, "compress_ratio", 0)
@@ -841,16 +787,16 @@ def substitute(self, hidden_states, kv_cache, metadata_list, output) -> bool:
     if ratio != COMPRESS_RATIO or decode is None:
         return False
     seq = _env_int("PTO_ATTN_SEQ", 1)
-    if seq != 1:
+    kcsa, _ = kernel()
+    if not 1 <= seq <= kcsa.S:
         if "seq" not in _DEBUG_REFUSED:
             _DEBUG_REFUSED.add("seq")
             print(
                 f"[pto-attn] declined host seq={seq}: native CSA currently "
-                "supports one token per request",
+                f"supports 1..{kcsa.S} tokens per request",
                 flush=True,
             )
         return False
-    kcsa, _ = kernel()
     if decode.input_positions.shape[0] % seq:
         if "position_rows" not in _DEBUG_REFUSED:
             _DEBUG_REFUSED.add("position_rows")
@@ -877,8 +823,9 @@ def substitute(self, hidden_states, kv_cache, metadata_list, output) -> bool:
             metadata_list,
             seq,
             self.dsa_attn.layer_name,
+            output=output,
         )
-        _pos, ks, n_real = plan
+        _pos, _, n_real = plan
         if not capture_active():
             if _OWNERSHIP_AUDITS[0] < 2:
                 audit_shared_pool_ownership(
@@ -895,9 +842,6 @@ def substitute(self, hidden_states, kv_cache, metadata_list, output) -> bool:
 
     _registered()(*args)
 
-    take = torch.arange(n_real, device=output.device) * ks
-    rows = args[-1].index_select(0, take)
-    output[: n_real * seq] = rows.to(output.dtype)
     _RAN[0] += 1
     # Capture happens once per descriptor and Python never runs on replay, so an
     # ungated print there costs one line per captured shape and is the only way

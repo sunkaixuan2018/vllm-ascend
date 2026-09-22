@@ -1,6 +1,8 @@
 """CPU checks for native vLLM page views, no device and no PyPTO."""
 
 import sys
+import types
+from unittest.mock import patch
 
 import torch
 
@@ -19,29 +21,22 @@ def check(name, cond, detail=""):
 
 print("== rope table ==")
 t = torch.arange(T * 64, dtype=torch.float32).view(T, 1, 1, 64)
-r = pa._rope_to_pto(t)
-check("shape", list(r.shape) == [T, 64], str(list(r.shape)))
-check("halves equal", torch.equal(r[:, :32], r[:, 32:]))
-
-print("== rectangular compressed rows ==")
-rect_seq = 8
-rect_pos = torch.tensor([3, 7, 11, 15], dtype=torch.int32).repeat_interleave(rect_seq)
-boundary, compressed_row = pa._compressed_rows(rect_pos, rect_seq)
-want_rows = torch.arange(4, dtype=torch.int64).repeat_interleave(rect_seq)
-check("all ratio-4 boundary rows", bool(boundary.all()))
-check(
-    "rows stay request-major",
-    torch.equal(compressed_row, want_rows),
-    f"{compressed_row[::rect_seq].tolist()} vs {want_rows[::rect_seq].tolist()}",
+rope_module = types.ModuleType("vllm_ascend.ops.rope_dsv4")
+rope_module._ROPE_STATE = types.SimpleNamespace(
+    layer_info={"layer": ("config", ["default"])},
+    static_cache={"config": (t, t)},
 )
-mixed_pos = torch.tensor([0, 3, 4, 7], dtype=torch.int32).repeat_interleave(rect_seq)
-mixed_boundary, mixed_row = pa._compressed_rows(mixed_pos, rect_seq)
-check(
-    "mixed boundaries use packed ordinals",
-    mixed_boundary[::rect_seq].tolist() == [False, True, False, True]
-    and mixed_row[::rect_seq].tolist() == [0, 0, 0, 1],
-    str(mixed_row[::rect_seq].tolist()),
-)
+with patch.dict(sys.modules, {"vllm_ascend.ops.rope_dsv4": rope_module}):
+    cos, sin = pa._native_rope_tables("layer")
+    check("shape", list(cos.shape) == [T, 64])
+    check("no copy", cos.data_ptr() == t.data_ptr() == sin.data_ptr())
+    check("no conversion", cos.dtype == torch.float32 and torch.equal(cos, t.view(T, 64)))
+    rope_module._ROPE_STATE.static_cache["config"] = (t.bfloat16(), t.bfloat16())
+    try:
+        pa._native_rope_tables("layer")
+        check("reject incompatible dtype", False)
+    except pa.NativeLayoutError:
+        check("reject incompatible dtype", True)
 
 print("== native padded-page views ==")
 main_state_parent = torch.arange(

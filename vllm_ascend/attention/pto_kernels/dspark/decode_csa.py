@@ -18,7 +18,7 @@ from . import config
 
 # TP specialization before sub-kernel imports.
 _TP_CHOICES = (1, 2, 4)
-_TP_DEFAULT = 2
+_TP_DEFAULT = 1
 
 
 def _parse_tp_argv():
@@ -45,7 +45,7 @@ from .config import (
 from .decode_compressor_ratio4 import compressor_ratio4_vllm
 from .decode_indexer import indexer_vllm
 from .decode_indexer_compressor import indexer_compressor_vllm
-from .qkv_proj_rope import qkv_proj_rope
+from .qkv_proj_rope import kv_proj_rope, q_proj_rope
 from .decode_o_proj import (
     LOCAL_T,
     LOCAL_T_PAD,
@@ -59,6 +59,8 @@ from .decode_sparse_attn_csa import (
 # Dynamic shape variables.
 B_DYN = pl.dynamic("B_DYN")  # per-request axis
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
+ROPE_ROWS_DYN = pl.dynamic("VLLM_ROPE_ROWS_DYN")
+CMP_ROPE_ROWS_DYN = pl.dynamic("VLLM_CMP_ROPE_ROWS_DYN")
 VLLM_COMPRESS_STATE_PAGE_NUM_DYN = pl.dynamic(
     "VLLM_COMPRESS_STATE_PAGE_NUM_DYN"
 )
@@ -85,7 +87,6 @@ D = M.hidden_size
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
 ROPE_HEAD_DIM = M.qk_rope_head_dim
-HALF_ROPE = ROPE_HEAD_DIM // 2
 Q_LORA = M.q_lora_rank
 IDX_N_HEADS = M.index_n_heads
 IDX_HEAD_DIM = M.index_head_dim
@@ -123,10 +124,10 @@ def _decode_csa_attn_tp1(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.FP32],
+    freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.FP32],
+    cmp_freqs_cos: pl.Tensor[[CMP_ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.FP32],
+    cmp_freqs_sin: pl.Tensor[[CMP_ROPE_ROWS_DYN, ROPE_HEAD_DIM], pl.FP32],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -190,7 +191,7 @@ def _decode_csa_attn_tp1(
     index_block_table: pl.Tensor[
         [B_DYN, VLLM_INDEX_TABLE_WIDTH_DYN], pl.INT32
     ],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT64],
     token_valid: pl.Tensor[[T_DYN], pl.INT32],
     kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -199,12 +200,16 @@ def _decode_csa_attn_tp1(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
 ):
-    """CSA attention-only path over vLLM's native paged cache layout."""
+    """Consume real token rows and native interleaved FP32 RoPE tables.
+
+    RoPE inputs are persistent tables indexed by absolute position, not
+    token-local or compact boundary rows. Their extents are independent of T.
+    """
     x_normed.bind_dynamic(0, T_DYN)
-    freqs_cos.bind_dynamic(0, T_DYN)
-    freqs_sin.bind_dynamic(0, T_DYN)
-    cmp_freqs_cos.bind_dynamic(0, T_DYN)
-    cmp_freqs_sin.bind_dynamic(0, T_DYN)
+    freqs_cos.bind_dynamic(0, ROPE_ROWS_DYN)
+    freqs_sin.bind_dynamic(0, ROPE_ROWS_DYN)
+    cmp_freqs_cos.bind_dynamic(0, CMP_ROPE_ROWS_DYN)
+    cmp_freqs_sin.bind_dynamic(0, CMP_ROPE_ROWS_DYN)
     position_ids.bind_dynamic(0, T_DYN)
     token_valid.bind_dynamic(0, T_DYN)
     attn_out.bind_dynamic(0, T_DYN)
@@ -231,6 +236,8 @@ def _decode_csa_attn_tp1(
     t_dim = pl.tensor.dim(x_normed, 0)
     b_dim = pl.tensor.dim(kv_seq_lens, 0)
     s_dim = t_dim // b_dim
+    positions_i32 = pl.create_tensor([t_dim], dtype=pl.INT32)
+    rope_swap_idx = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.INT32)
     idx_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     idx_sin_signed = pl.create_tensor(
         [t_dim, ROPE_HEAD_DIM], dtype=pl.FP32,
@@ -242,7 +249,7 @@ def _decode_csa_attn_tp1(
     with pl.at(
         level=pl.Level.CORE_GROUP, name_hint="csa_vllm_rope_interleave",
     ) as rope_tid:
-        ones = pl.full([4, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+        ones = pl.full([1, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
         columns = pl.col_expand_mul(
             ones,
             pl.cast(
@@ -256,50 +263,29 @@ def _decode_csa_attn_tp1(
             ),
             target_type=pl.FP32,
         )
-        duplicate_index = pl.cast(duplicate, target_type=pl.INT32)
         lane = pl.sub(columns, pl.mul(duplicate, 2.0))
         sign = pl.sub(pl.mul(lane, 2.0), 1.0)
-        for token_begin in pl.range(0, t_dim, 4):
-            idx_cos_half = pl.cast(
-                freqs_cos[
-                    token_begin : token_begin + 4, 0:HALF_ROPE
-                ],
-                target_type=pl.FP32,
+        swap = pl.cast(
+            pl.sub(pl.add(columns, 1.0), pl.mul(lane, 2.0)), pl.INT32,
+        )
+        for token in pl.range(t_dim):
+            position = pl.cast(pl.read(position_ids, [token]), pl.INDEX)
+            active_position = -1
+            if pl.read(token_valid, [token]) != 0:
+                active_position = position
+            pl.write(positions_i32, [token], pl.cast(active_position, pl.INT32))
+            # Inactive rows only read table row zero and never publish state.
+            rope_row = pl.max(active_position, 0)
+            cmp_row = pl.max(active_position + 1 - COMPRESS_RATIO, 0)
+            idx_cos_il[token : token + 1, :] = freqs_cos[rope_row : rope_row + 1, :]
+            idx_sin_signed[token : token + 1, :] = pl.mul(
+                freqs_sin[rope_row : rope_row + 1, :], sign,
             )
-            idx_cos_il[
-                token_begin : token_begin + 4, 0:ROPE_HEAD_DIM
-            ] = pl.gather(idx_cos_half, dim=-1, index=duplicate_index)
-            idx_sin_half = pl.cast(
-                freqs_sin[
-                    token_begin : token_begin + 4, 0:HALF_ROPE
-                ],
-                target_type=pl.FP32,
+            cmp_cos_il[token : token + 1, :] = cmp_freqs_cos[cmp_row : cmp_row + 1, :]
+            cmp_sin_signed[token : token + 1, :] = pl.mul(
+                cmp_freqs_sin[cmp_row : cmp_row + 1, :], sign,
             )
-            idx_sin_signed[
-                token_begin : token_begin + 4, 0:ROPE_HEAD_DIM
-            ] = pl.mul(
-                pl.gather(idx_sin_half, dim=-1, index=duplicate_index), sign,
-            )
-            cmp_cos_half = pl.cast(
-                cmp_freqs_cos[
-                    token_begin : token_begin + 4, 0:HALF_ROPE
-                ],
-                target_type=pl.FP32,
-            )
-            cmp_cos_il[
-                token_begin : token_begin + 4, 0:ROPE_HEAD_DIM
-            ] = pl.gather(cmp_cos_half, dim=-1, index=duplicate_index)
-            cmp_sin_half = pl.cast(
-                cmp_freqs_sin[
-                    token_begin : token_begin + 4, 0:HALF_ROPE
-                ],
-                target_type=pl.FP32,
-            )
-            cmp_sin_signed[
-                token_begin : token_begin + 4, 0:ROPE_HEAD_DIM
-            ] = pl.mul(
-                pl.gather(cmp_sin_half, dim=-1, index=duplicate_index), sign,
-            )
+            rope_swap_idx[token : token + 1, :] = swap
 
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
@@ -307,23 +293,25 @@ def _decode_csa_attn_tp1(
     qr_scale = pl.create_tensor([t_dim, 1], dtype=pl.FP32)
     topk_scores = pl.create_tensor([t_dim, IDX_TOPK], dtype=pl.FP32)
     topk_indices = pl.create_tensor([t_dim, IDX_TOPK], dtype=pl.INT32)
-    position_ids_2d = pl.reshape(position_ids, [t_dim, 1])
+    position_ids_2d = pl.reshape(positions_i32, [t_dim, 1])
     late_dep = pl.system.task_dummy(deps=[rope_tid])
-    qkv_proj_rope(
+    q_proj_rope(
         x_normed,
         wq_a,
         wq_b,
         wq_b_scale,
-        wkv,
-        freqs_cos,
-        freqs_sin,
         gamma_cq,
-        gamma_ckv,
+        idx_cos_il,
+        idx_sin_signed,
+        rope_swap_idx,
         q,
-        kv,
         qr,
         qr_scale,
         late_dep,
+    )
+    kv_proj_rope(
+        x_normed, wkv, gamma_ckv, idx_cos_il, idx_sin_signed,
+        rope_swap_idx, kv, late_dep,
     )
 
     with pl.spmd(
@@ -333,7 +321,7 @@ def _decode_csa_attn_tp1(
         for token in pl.range(worker, t_dim, TP1_CSA_WB_WORKERS):
             if pl.read(token_valid, [token]) != 0:
                 request = token // s_dim
-                position = pl.read(position_ids, [token])
+                position = pl.cast(pl.read(positions_i32, [token]), pl.INDEX)
                 logical_page = position // VLLM_KV_PAGE_ROWS
                 physical_page_i32 = pl.read(
                     ori_block_table, [request, logical_page],
@@ -365,7 +353,7 @@ def _decode_csa_attn_tp1(
         cmp_cos_il,
         cmp_sin_signed,
         cmp_block_table,
-        position_ids,
+        positions_i32,
         token_valid,
         late_dep,
         raw_cache_tid,
@@ -384,7 +372,7 @@ def _decode_csa_attn_tp1(
         cmp_sin_signed,
         hadamard_idx,
         index_block_table,
-        position_ids,
+        positions_i32,
         token_valid,
         late_dep,
         cmp_projection_tid,
@@ -403,7 +391,7 @@ def _decode_csa_attn_tp1(
         index_block_table,
         topk_scores,
         topk_indices,
-        position_ids,
+        positions_i32,
         kv_seq_lens,
         idx_cache_tid,
     )
@@ -424,8 +412,8 @@ def _decode_csa_attn_tp1(
         position_ids_2d,
         token_valid,
         attn_sink,
-        freqs_cos,
-        freqs_sin,
+        idx_cos_il,
+        idx_sin_signed,
         o_packed_heads,
         attention_ready,
     )

@@ -197,7 +197,8 @@ def indexer_topk_query_merge_one(
     topk_indices: pl.Tensor[[T_DYN, IDX_TOPK], pl.INT32],
 ):
     """Merge half-leaf roots and materialize one query's Top-512."""
-    batch_idx = query // S
+    s_dim = pl.tensor.dim(position_ids, 0) // pl.tensor.dim(kv_seq_lens, 0)
+    batch_idx = query // s_dim
     position = pl.read(position_ids, [query])
     cache_len = pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO
     cache_bound = pl.min(cache_len, (position + 1) // COMPRESS_RATIO)
@@ -324,9 +325,10 @@ def indexer_topk_single_leaf_publish(
     """Sort a single leaf and publish each query's Top-512 directly."""
     worker = pl.tile.get_block_idx()
     query_count = pl.tensor.dim(position_ids, 0)
+    s_dim = query_count // pl.tensor.dim(kv_seq_lens, 0)
     for query in pl.range(worker, query_count, TOPK_QUERY_WORKERS):
         position = pl.read(position_ids, [query])
-        cache_len = pl.read(kv_seq_lens, [query // S]) // COMPRESS_RATIO
+        cache_len = pl.read(kv_seq_lens, [query // s_dim]) // COMPRESS_RATIO
         visible_count = pl.max(pl.min(cache_len, (position + 1) // COMPRESS_RATIO), 0)
         if visible_count > 0:
             indexer_topk_leaf_publish(score_arena, query, visible_count, topk_scores, topk_indices)
@@ -381,8 +383,9 @@ def indexer_score_topk_forest(
     ) as score_tid:
         worker = pl.tile.get_block_idx()
         query_count = pl.tensor.dim(position_ids, 0)
+        s_dim = query_count // b_dim
         max_cache_len = 0
-        for batch in pl.range(query_count // S):
+        for batch in pl.range(b_dim):
             batch_cache_len = pl.read(kv_seq_lens, [batch]) // COMPRESS_RATIO
             max_cache_len = pl.max(max_cache_len, batch_cache_len)
         max_leaves = pl.max((pl.min(max_cache_len, TOPK_MAX_CANDIDATES) + TOPK_CANDIDATES_PER_LEAF - 1) // TOPK_CANDIDATES_PER_LEAF, 1)
@@ -390,7 +393,7 @@ def indexer_score_topk_forest(
         for item in pl.range(worker, query_count * max_leaves, TOPK_SCORE_WORKERS):
             query = item // max_leaves
             leaf = item % max_leaves
-            batch_idx = query // S
+            batch_idx = query // s_dim
             position = pl.read(position_ids, [query])
             cache_len = pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO
             cache_bound = pl.min(cache_len, (position + 1) // COMPRESS_RATIO)
@@ -548,8 +551,9 @@ def indexer_score_topk_forest_vllm(
     ) as score_tid:
         worker = pl.tile.get_block_idx()
         query_count = pl.tensor.dim(position_ids, 0)
+        s_dim = query_count // b_dim
         max_cache_len = 0
-        for batch in pl.range(query_count // S):
+        for batch in pl.range(b_dim):
             batch_cache_len = pl.read(kv_seq_lens, [batch]) // COMPRESS_RATIO
             max_cache_len = pl.max(max_cache_len, batch_cache_len)
         max_leaves = pl.max(
@@ -567,7 +571,7 @@ def indexer_score_topk_forest_vllm(
         ):
             query = item // max_leaves
             leaf = item % max_leaves
-            batch_idx = query // S
+            batch_idx = query // s_dim
             position = pl.read(position_ids, [query])
             cache_len = pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO
             cache_bound = pl.min(cache_len, (position + 1) // COMPRESS_RATIO)
@@ -883,7 +887,8 @@ def indexer_qr_rope(
                 qr_acc_pad[qr_r0 : qr_r0 + MM_ROW_TILE, o_base + ns : o_base + ns + MM_N_TILE] = qr_acc
     # Fused dequant + RoPE: one unit is DEQUANT_T_TILE tokens x DQ_ROPE_H_TILE heads.
     qr_bf16_2d = pl.reshape(qr_bf16, [T_PAD, IDX_N_HEADS * IDX_HEAD_DIM])
-    dq_rope_units = (bs // DEQUANT_T_TILE) * (IDX_N_HEADS // DQ_ROPE_H_TILE)
+    qr_scale_row = pl.reshape(qr_scale, [1, bs])
+    dq_rope_units = ((bs + DEQUANT_T_TILE - 1) // DEQUANT_T_TILE) * (IDX_N_HEADS // DQ_ROPE_H_TILE)
     dq_rope_workers = pl.min(dq_rope_units, DQ_ROPE_WORKERS)
     for dq_rope_worker in pl.spmd(dq_rope_workers, name_hint="idx_qr_dequant_rope", allow_early_resolve=True):
         sw_ones = pl.full([DEQUANT_T_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
@@ -895,9 +900,20 @@ def indexer_qr_rope(
         for dq_unit in pl.range(dq_rope_worker, dq_rope_units, dq_rope_workers):
             hg = (dq_unit % (IDX_N_HEADS // DQ_ROPE_H_TILE)) * DQ_ROPE_H_TILE
             dq_t0 = (dq_unit // (IDX_N_HEADS // DQ_ROPE_H_TILE)) * DEQUANT_T_TILE
-            qr_scale_tile = qr_scale[dq_t0 : dq_t0 + DEQUANT_T_TILE, :]
-            cos_tile = cos[dq_t0 : dq_t0 + DEQUANT_T_TILE, 0 : ROPE_HEAD_DIM]
-            sin_tile = sin[dq_t0 : dq_t0 + DEQUANT_T_TILE, 0 : ROPE_HEAD_DIM]
+            dq_rows = pl.min(DEQUANT_T_TILE, bs - dq_t0)
+            # Pad the contiguous row: A2/A3 fillpad does not support a
+            # one-column physical tile. Restore the broadcast view afterward.
+            qr_scale_tile = pl.reshape(pl.fillpad(pl.slice(
+                qr_scale_row, [1, DEQUANT_T_TILE], [0, dq_t0], valid_shape=[1, dq_rows],
+            ), pad_value=pl.PadValue.zero), [DEQUANT_T_TILE, 1])
+            cos_tile = pl.fillpad(pl.slice(
+                cos, [DEQUANT_T_TILE, ROPE_HEAD_DIM], [dq_t0, 0],
+                valid_shape=[dq_rows, ROPE_HEAD_DIM],
+            ), pad_value=pl.PadValue.zero)
+            sin_tile = pl.fillpad(pl.slice(
+                sin, [DEQUANT_T_TILE, ROPE_HEAD_DIM], [dq_t0, 0],
+                valid_shape=[dq_rows, ROPE_HEAD_DIM],
+            ), pad_value=pl.PadValue.zero)
             for h_inner in pl.pipeline(DQ_ROPE_H_TILE, stage=2):
                 h0 = (hg + h_inner) * IDX_HEAD_DIM
                 wq_scale = pl.reshape(wq_b_scale[h0 : h0 + IDX_HEAD_DIM], [1, IDX_HEAD_DIM])

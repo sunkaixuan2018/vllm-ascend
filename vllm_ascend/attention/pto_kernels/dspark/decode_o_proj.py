@@ -17,7 +17,7 @@ from . import config
 # TP-derived shapes freeze at import time, so select the TP world before the
 # config read below.
 _TP_CHOICES = (1, 2, 4)
-_TP_DEFAULT = 2
+_TP_DEFAULT = 1
 
 
 def _parse_tp_argv():
@@ -256,7 +256,10 @@ def decode_o_proj_tp1(
                 acc = pl.add(acc, p_g_scaled)
             out_t = pl.col_expand_mul(acc, wb_scale_chunk)
             out_bf16 = pl.cast(out_t, target_type=pl.BF16, mode="rint")
-            attn_out[b_tb : b_tb + PROJ_B_ACT_T_TILE, ob_n0 : ob_n0 + PROJ_B_ACT_N_TILE] = out_bf16
+            out_rows = pl.min(PROJ_B_ACT_T_TILE, t_dim - b_tb)
+            attn_out[b_tb : b_tb + PROJ_B_ACT_T_TILE, ob_n0 : ob_n0 + PROJ_B_ACT_N_TILE] = pl.set_validshape(
+                out_bf16, out_rows, PROJ_B_ACT_N_TILE
+            )
 
     return attn_out
 
