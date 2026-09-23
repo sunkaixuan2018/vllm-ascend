@@ -16,6 +16,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
 from contextlib import suppress
 from typing import Any
 
@@ -46,9 +47,15 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
         if msmonitor_use_daemon:
             raise RuntimeError("MSMONITOR_USE_DAEMON and torch profiler cannot be both enabled at the same time.")
 
+        # Level2 额外带上 AICPU 与通信算子，device 侧的时间线才算完整。
+        level = {
+            "Level0": torch_npu.profiler.ProfilerLevel.Level0,
+            "Level1": torch_npu.profiler.ProfilerLevel.Level1,
+            "Level2": torch_npu.profiler.ProfilerLevel.Level2,
+        }[(os.environ.get("VLLM_ASCEND_PROFILER_LEVEL") or "Level1").strip()]
         experimental_config = torch_npu.profiler._ExperimentalConfig(
             export_type=torch_npu.profiler.ExportType.Text,
-            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            profiler_level=level,
             msprof_tx=False,
             aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
             l2_cache=False,
@@ -63,10 +70,12 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
                 torch_npu.profiler.ProfilerActivity.CPU,
                 torch_npu.profiler.ProfilerActivity.NPU,
             ],
-            with_stack=False,
+            # with_modules 只给到模块层级，看不到 Python 帧。要在 trace 里读出
+            # 某个 kernel 是从哪段 Python 下发的（例如 CSA 替换走的是 vendor 还是
+            # PTO），必须开 with_stack —— 代价是明显的采集开销，所以仍然由
+            # --profiler-config.torch_profiler_with_stack 控制，默认行为不变。
+            with_stack=profiler_config.torch_profiler_with_stack,
             profile_memory=profiler_config.torch_profiler_with_memory,
-            # NOTE: torch_npu.profiler.with_modules is equivalent to torch.profiler.with_stack.
-            # The with_stack option in torch_npu.profiler introduces significant time overhead.
             with_modules=profiler_config.torch_profiler_with_stack,
             experimental_config=experimental_config,
             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(

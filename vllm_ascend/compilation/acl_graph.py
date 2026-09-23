@@ -19,6 +19,7 @@ from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
 from ..utils import weak_ref_tensors
@@ -210,7 +211,13 @@ class ACLGraphWrapper:
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
         if not self.enable_enpu and need_sync:
             torch.npu.current_stream().synchronize()
-        entry.aclgraph.replay()
+        if ascend_envs.VLLM_ASCEND_PTO_CSA_SWIMLANE_LEVEL:
+            from vllm_ascend.attention.pto_csa import graph_replay_swimlane
+
+            with graph_replay_swimlane(f"{self.runtime_mode.name}:{batch_descriptor}"):
+                entry.aclgraph.replay()
+        else:
+            entry.aclgraph.replay()
         return entry.output
 
 

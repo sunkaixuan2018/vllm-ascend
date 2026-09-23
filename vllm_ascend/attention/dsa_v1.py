@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, TypeAlias
 
@@ -30,6 +31,11 @@ from vllm_ascend.utils import (
     olora_tp_enable,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+
+# PTO CSA 替换点的形状探针开关。只读不改，置空即整体关闭。
+_PTO_CSA_PROBE = bool(os.environ.get("PTO_CSA_PROBE", "").strip())
+# ratio-4 层的 decode 路径整段换成 PTO kernel（注意力+逆RoPE+o_proj）。
+_PTO_CSA_ON = os.environ.get("PTO_CSA", "").strip() not in ("", "0", "false", "False")
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -1624,6 +1630,20 @@ class AscendDSAImpl(DSAAttentionImpl):
         sin = attn_metadata[0].sin[layer_name]
         num_tokens = o_proj_input.shape[0]
 
+        if _PTO_CSA_PROBE:
+            from vllm_ascend.attention.pto_csa import probe_oproj
+
+            probe_oproj(
+                self,
+                layer_name,
+                o_proj_input=o_proj_input,
+                cos=cos,
+                sin=sin,
+                decode_tokens=decode_tokens,
+                actual_tokens=actual_tokens,
+                num_tokens=num_tokens,
+            )
+
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             o_proj_input.unsqueeze(1),
             cos,
@@ -1651,6 +1671,26 @@ class AscendDSAImpl(DSAAttentionImpl):
             )
             o_proj_input = o_proj_input.reshape(num_tokens, -1)
         output[...] = self.wo_b(o_proj_input)
+
+        if _PTO_CSA_ON:
+            from vllm_ascend.attention.pto_csa import note_forward
+
+            note_forward(self, layer_name, has_decode=has_decode, has_prefill=has_prefill, md=attn_metadata[0])
+
+        # 只要这一步有 decode 就替换，**不要求纯 decode**：开了 aclgraph + chunked prefill
+        # 之后，调度基本每步都把 prefill 和 decode 混在一起，纯 decode 的步一次都不出现。
+        # 混合步里 decode 的 token 固定排在前 decode_tokens 行（见上面 hidden_states 的切分），
+        # 所以只覆盖 output[:rows] 仍然只动 decode 那部分。
+        if _PTO_CSA_ON and has_decode:
+            from vllm_ascend.attention.pto_csa import dump_vendor, get_runner, report
+
+            pto_out = get_runner().run_decode(self, cos=cos, sin=sin, layer_name=layer_name)
+            if pto_out is not None:
+                rows = pto_out.shape[0]
+                dump_vendor(output[:rows])
+                report(layer_name, output[:rows], pto_out)
+                output[:rows] = pto_out
+            self._pto_csa_stash = None
 
         return output_padded
 
@@ -2354,6 +2394,38 @@ class AscendDSAImpl(DSAAttentionImpl):
                 layout_kv="PA_ND",
             )[0]
         elif self.compress_ratio == 4:
+            if _PTO_CSA_PROBE:
+                from vllm_ascend.attention.pto_csa import probe_attention
+
+                probe_attention(
+                    self,
+                    layer_name,
+                    q=q,
+                    ori_kv=swa_kv_cache,
+                    cmp_kv=compress_kv_cache,
+                    cmp_sparse_indices=compress_topk_idxs,
+                    ori_block_table=swa_decode_metadata.block_table,
+                    cmp_block_table=compressor_decode_metadata.block_table,
+                    cu_seqlens_q=actual_seq_lengths_query,
+                    seqused_kv=actual_seq_lengths_key,
+                    sinks=self.attn_sink,
+                    softmax_scale=self.softmax_scale,
+                    positions=getattr(common_decode_metadata, "input_positions", None),
+                )
+            if _PTO_CSA_ON:
+                from vllm_ascend.attention.pto_csa import stash_decode_inputs
+
+                stash_decode_inputs(
+                    self,
+                    q=q,
+                    ori_kv=swa_kv_cache,
+                    cmp_kv=compress_kv_cache,
+                    cmp_sparse_indices=compress_topk_idxs,
+                    ori_block_table=swa_decode_metadata.block_table,
+                    cmp_block_table=compressor_decode_metadata.block_table,
+                    seqused_kv=actual_seq_lengths_key,
+                    positions=getattr(common_decode_metadata, "input_positions", None),
+                )
             attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
                 q,
                 ori_kv=swa_kv_cache,
@@ -2374,6 +2446,10 @@ class AscendDSAImpl(DSAAttentionImpl):
                 layout_q="TND",
                 layout_kv="PA_ND",
             )[0]
+            if _PTO_CSA_ON:
+                from vllm_ascend.attention.pto_csa import dump_vendor_attn
+
+                dump_vendor_attn(attn_output)
         else:
             attn_output = torch.ops._C_ascend.npu_sparse_attn_sharedkv(
                 q,

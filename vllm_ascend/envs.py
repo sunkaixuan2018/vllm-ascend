@@ -28,6 +28,18 @@ from typing import Any
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # CSA eager / ACLGraph replay diagnostics. Level 0 disables capture (default);
+    # levels 1..4 enable chip swimlane plus dependency collection. Non-sensitive.
+    "VLLM_ASCEND_PTO_CSA_SWIMLANE_LEVEL": lambda: int(os.getenv("VLLM_ASCEND_PTO_CSA_SWIMLANE_LEVEL", "0")),
+    # Output root; required when level > 0. Each worker creates a unique child.
+    # Default empty. This is an artifact path, not a credential.
+    "VLLM_ASCEND_PTO_CSA_SWIMLANE_DIR": lambda: os.getenv("VLLM_ASCEND_PTO_CSA_SWIMLANE_DIR", ""),
+    # Positive maximum number of eager/replay collection windows per worker.
+    # Graph-enabled runs reserve the budget for replay; an empty replay counts.
+    # Default 1; ignored when capture is disabled. Non-sensitive.
+    "VLLM_ASCEND_PTO_CSA_SWIMLANE_MAX_CAPTURES": lambda: int(
+        os.getenv("VLLM_ASCEND_PTO_CSA_SWIMLANE_MAX_CAPTURES", "1")
+    ),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

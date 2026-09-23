@@ -25,6 +25,7 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import math
+import re
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -1195,6 +1196,15 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                 name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
             if ".attn_norm." in name:
                 name = name.replace(".attn_norm.", ".input_layernorm.")
+
+            # 截层测试用：loader 是按 index 挑出文件、再遍历文件内**全部**张量的，
+            # 所以一个分片里混着的、本模型没有的层也会流到这里。PP 的
+            # is_pp_missing_parameter 只认 PPMissingLayer 占位模块，认不出
+            # "层号 >= num_hidden_layers" 这种截断，于是下面各分支会 KeyError
+            # （最先撞上的是 sink 分支，它取 params_dict 前没有任何守卫）。
+            _lay = re.match(r"model\.layers\.(\d+)\.", name)
+            if _lay and int(_lay.group(1)) >= self.config.num_hidden_layers:
+                continue
 
             if "rotary_emb.inv_freq" in name:
                 continue

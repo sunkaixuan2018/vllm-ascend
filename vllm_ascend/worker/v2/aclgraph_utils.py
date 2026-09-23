@@ -16,6 +16,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -32,6 +33,7 @@ from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.compilation.acl_graph import set_graph_params, update_full_graph_params
 from vllm_ascend.worker.v2.utils import communicator_switch
@@ -69,32 +71,40 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
         logger.info_once(f"run_fullgraph with num_tokens={num_tokens}")
-        ret = super().run_fullgraph(desc)
+        # end_dfx drains the replay stream, so parameter updates that unblock
+        # external graph events must be submitted before closing the window.
+        swimlane = nullcontext()
+        if envs.VLLM_ASCEND_PTO_CSA_SWIMLANE_LEVEL:
+            from vllm_ascend.attention.pto_csa import graph_replay_swimlane
 
-        positions = self.model_runner.input_buffers.positions[:num_tokens]
-        # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
-        # calculate num_tokens_across_dp.
-        num_tokens_across_dp = torch.full([self.model_runner.dp_size], num_tokens, device=self.device)
-        with set_forward_context(
-            self.model_runner.model_state.attn_metadata,
-            self.vllm_config,
-            num_tokens=num_tokens,
-            cudagraph_runtime_mode=desc.cg_mode,
-            num_tokens_across_dp=num_tokens_across_dp,
-            batch_descriptor=None,  # Full graph model don't need batch_descriptor
-            slot_mapping=None,
-        ):
-            forward_context = get_forward_context()
-            update_full_graph_params(
-                # FIXME(Ronald1995): support hybrid attn backend
-                list(self.model_runner.attn_backends.values())[0],
-                self.model_runner.update_stream,
-                forward_context,
-                num_tokens,
+            swimlane = graph_replay_swimlane(f"v2_fullgraph:{desc}")
+        with swimlane:
+            ret = super().run_fullgraph(desc)
+
+            positions = self.model_runner.input_buffers.positions[:num_tokens]
+            # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
+            # calculate num_tokens_across_dp.
+            num_tokens_across_dp = torch.full([self.model_runner.dp_size], num_tokens, device=self.device)
+            with set_forward_context(
+                self.model_runner.model_state.attn_metadata,
                 self.vllm_config,
-                self.model_runner.speculative_config,
-                positions.shape[0],
-            )
+                num_tokens=num_tokens,
+                cudagraph_runtime_mode=desc.cg_mode,
+                num_tokens_across_dp=num_tokens_across_dp,
+                batch_descriptor=None,  # Full graph model don't need batch_descriptor
+                slot_mapping=None,
+            ):
+                forward_context = get_forward_context()
+                update_full_graph_params(
+                    # FIXME(Ronald1995): support hybrid attn backend
+                    list(self.model_runner.attn_backends.values())[0],
+                    self.model_runner.update_stream,
+                    forward_context,
+                    num_tokens,
+                    self.vllm_config,
+                    self.model_runner.speculative_config,
+                    positions.shape[0],
+                )
         return ret
 
     def capture(
